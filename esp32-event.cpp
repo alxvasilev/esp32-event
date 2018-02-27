@@ -94,7 +94,25 @@ int udpsock_create_and_bind()
     }
     return sock;
 }
-
+UV_CAPI int uv_loop_wake_up(uv_loop_s* loop)
+{
+    int rc = sendto(loop->mCtrlSendFd, "\0", 1, MSG_DONTWAIT, (struct sockaddr*)&loop->mCtrlAddr, sizeof(struct sockaddr_in));
+    if (rc == 1)
+    {
+        return 0;
+    }
+    else if (rc < 0)
+    {
+        UV_LOG_ERROR("uv_loop_wake_up: sendto() failed to send 1 byte over the control socket %s", strerror(errno));
+        return UV_ENOMEM;
+    }
+    else
+    {
+        assert(rc == 0);
+        UV_LOG_ERROR("uv_loop_wake_up: sendto() sent zero bytes over the control socket");
+        return UV_ENOMEM;
+    }
+}
 UV_CAPI int uv_loop_post_message(uv_loop_s* loop, uv_message* msg)
 {
     while(loop->mMsgQueueLen > UV_MSGQUEUE_MAX_LEN);
@@ -111,12 +129,7 @@ UV_CAPI int uv_loop_post_message(uv_loop_s* loop, uv_message* msg)
     }
     loop->mMsgQueueLast = msg;
     loop->mMsgQueueLen++;
-    int rc = sendto(loop->mCtrlSendFd, "\0", 1, MSG_DONTWAIT, (struct sockaddr*)&loop->mCtrlAddr, sizeof(struct sockaddr_in));
-    if (rc < 0)
-    {
-        UV_LOG_ERROR("uv_message_post: sendto() returned error %s", strerror(errno));
-        return UV_ENOMEM;
-    }
+    uv_loop_wake_up(loop);
     UV_LOG_DEBUG("Posted message %p to queue", msg);
     return 0;
 }
@@ -257,7 +270,6 @@ bool loopMaybeFireFirstTimer(uv_loop_s* loop, uv_time_t now)
         return false;
 
     loop->mTimers = timer->mNext; //remove timer
-    timer->type &= ~UV_ACTIVE_BIT;
     if (timer->mPeriod)
     {
         timer->mFireTime = now + timer->mPeriod;
@@ -299,25 +311,30 @@ UV_CAPI int uv_loop_run_once(uv_loop_t* loop, uv_time_t timeout)
     while((timeToWait = until-now) >= 0)
     {
         if (loopMaybeFireFirstTimer(loop, now))
-        {
             continue;
-        }
-        if (loop->mFlags & kPollsUpdated)
+
+        uint8_t flags = loop->mFlags;
+        if (flags & kPollsUpdated)
         {
+            // We will completely rebuild the fdsets, that includes mPollEventsUpdated
+            // Reset the flag before, because if we do it after rebuilding the fdsets,
+            // we may miss the events updated event, if it happens during rebuilding the fdsets
             loop->mFlags &= ~kPollsUpdated;
+            loop->mPollEventsUpdated = 0;
+
             FD_ZERO(&rfds);
             FD_ZERO(&wfds);
             FD_ZERO(&efds);
             highest = loop->mCtrlRecvFd;
-            for(uv_poll_s* pfd = loop->mPolls; pfd; pfd = pfd->mNext)
+            for(uv_poll_s* poll = loop->mPolls; poll; poll = poll->mNext)
             {
-                int fd = pfd->fd;
-                uv_poll_event events = pfd->mEvents;
+                int fd = poll->fd;
+                uv_poll_event events = poll->mEvents;
                 if (events & UV_READABLE)
                 {
                     FD_SET(fd, &rfds);
                 }
-                if (events * UV_WRITABLE)
+                if (events & UV_WRITABLE)
                 {
                     FD_SET(fd, &wfds);
                 }
@@ -329,6 +346,28 @@ UV_CAPI int uv_loop_run_once(uv_loop_t* loop, uv_time_t timeout)
             }
             FD_SET(loop->mCtrlRecvFd, &rfds);
         }
+        else if (loop->mPollEventsUpdated)
+        {
+            loop->mPollEventsUpdated = 0;
+            for(uv_poll_s* poll = loop->mPolls; poll; poll = poll->mNext)
+            {
+                uv_poll_event events = poll->mEvents;
+                if ((events & UV_EVENTS_UPDATED) == 0)
+                    continue;
+                poll->mEvents &= ~UV_EVENTS_UPDATED;
+                int fd = poll->fd;
+                if (events & UV_READABLE)
+                    FD_SET(fd, &rfds);
+                else
+                    FD_CLR(fd, &rfds);
+
+                if (events & UV_WRITABLE)
+                    FD_SET(fd, &wfds);
+                else
+                    FD_CLR(fd, &wfds);
+            }
+        }
+
         struct timeval tv = {
             .tv_sec = timeToWait / 1000,
             .tv_usec = (timeToWait % 1000)*1000
@@ -429,31 +468,48 @@ UV_CAPI int uv_run(uv_loop_t* loop, uv_run_mode mode)
     return -1;
 }
 
-UV_CAPI int uv_poll_start(uv_poll_t* handle, int events, uv_poll_cb cb)
+UV_CAPI int uv_poll_start(uv_poll_t* poll, int events, uv_poll_cb cb)
 {
-    loop_assert_thread(handle->loop);
-    int wasActive = handle->type & UV_ACTIVE_BIT;
-    handle->mEvents = events;
-    handle->mCallback = cb;
-    if (!wasActive) //already active, update it
+    assert(events);
+    loop_assert_thread(poll->loop);
+    bool wasActive = (poll->mNext != nullptr);
+    poll->mEvents = events;
+    poll->mCallback = cb;
+    auto loop = poll->loop;
+
+    if (wasActive)
     {
-        handle->type |= UV_ACTIVE_BIT;
-        auto loop = handle->loop;
-        handle->mNext = loop->mPolls;
-        loop->mPolls = handle;
+        loop->mPollEventsUpdated = 1;
     }
+    else
+    {
+        poll->mNext = loop->mPolls;
+        loop->mPolls = poll;
+        loop->mFlags |= kPollsUpdated;
+    }
+    return 0;
+}
+
+// Thread safe
+UV_CAPI int uv_poll_update_events(uv_poll_t* poll, int events)
+{
+    poll->mEvents = events | UV_EVENTS_UPDATED;
+    poll->loop->mPollEventsUpdated = 1;
+    uv_loop_wake_up(poll->loop);
     return 0;
 }
 
 UV_CAPI int uv_poll_stop(uv_poll_t* poll)
 {
-    loop_assert_thread(poll->loop);
-    auto prev = listGetPrevious(poll->loop->mPolls, poll);
+    auto loop = poll->loop;
+    loop_assert_thread(loop);
+    auto prev = listGetPrevious(loop->mPolls, poll);
     if (prev)
     {
         prev->mNext = poll->mNext;
     }
-    poll->type &= ~UV_ACTIVE_BIT;
+    poll->mNext = nullptr;
+    loop->mFlags |= kPollsUpdated;
     return 0;
 }
 
@@ -470,14 +526,15 @@ struct AsyncExecMessage: public uv_message
     AsyncExecMessage(uv_async_t* async)
     : uv_message(handler), mAsync(async)
     {
-        async->type |= UV_ACTIVE_BIT;
+        assert(!async->mActive);
+        async->mActive = 1;
     }
     static void handler(uv_message* msg)
     {
         auto async = static_cast<AsyncExecMessage*>(msg)->mAsync;
         if (async) //if the async handle was closed, this will be set to NULL
         {
-            async->type &= ~UV_ACTIVE_BIT; //first reset the but, so that the callback can add it again and not get EALREADY
+            async->mActive = 0; //first reset it, so that the callback can add it again and not get EALREADY
             async->mCallback(async);
         }
         delete static_cast<AsyncExecMessage*>(msg);
@@ -486,7 +543,7 @@ struct AsyncExecMessage: public uv_message
 
 UV_CAPI int uv_async_send(uv_async_t* async)
 {
-    if (async->type & UV_ACTIVE_BIT)
+    if (async->mActive)
         return UV_EALREADY;
     auto newmsg = new AsyncExecMessage(async);
     return uv_loop_post_message(async->loop, newmsg);
@@ -529,15 +586,14 @@ void asyncClose(uv_async_t* async)
     MutexLocker locker(loop->mMsgQueueMutex);
     for (auto msg = loop->mMsgQueue; msg; msg = msg->mNext)
     {
-        if (msg->mCfunc == AsyncExecMessage::handler) //it's a message that executes an async_t handle
+        if (msg->mCfunc != AsyncExecMessage::handler) //it's a message that executes an async_t handle
+            continue;
+        auto am = static_cast<AsyncExecMessage*>(msg);
+        if (am->mAsync == async)
         {
-            auto am = static_cast<AsyncExecMessage*>(msg);
-            if (am->mAsync == async)
-            {
-                am->mAsync->type &= ~UV_ACTIVE_BIT;
-                am->mAsync = NULL;
-                return;
-            }
+            am->mAsync = NULL;
+            am->mAsync->mActive = 0;
+            return;
         }
     }
 }
@@ -545,7 +601,7 @@ void asyncClose(uv_async_t* async)
 void doCloseHandle(uv_handle_t* handle)
 {
     loop_assert_thread(handle->loop);
-    switch(handle->type & ~UV_ACTIVE_BIT)
+    switch(handle->type)
     {
     case UV_POLL:
         pollClose((uv_poll_t*)handle);
