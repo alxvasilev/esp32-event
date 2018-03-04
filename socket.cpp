@@ -249,7 +249,7 @@ int TcpClientSocket::connectHost(const char* host, uint16_t port)
     auto dnsReq = new uvx_dns_resolve4_t;
     dnsReq->addr.sin_port = htons(port);
     auto ret = uvx_dns_resolve4(mPoll.loop, host, dnsReq,
-    [](uvx_dns_resolve4_t* req) -> int
+    [](uvx_dns_resolve4_t* req, int error) -> int
     {
         printf("user resolve cb\n");
         auto self = static_cast<TcpClientSocket*>(req->data);

@@ -705,6 +705,16 @@ UV_CAPI int uv_loop_close(uv_loop_t* loop)
     return 0;
 }
 
+static void dns4ResultRelayTask(void* arg)
+{
+    auto self = static_cast<uvx_dns_resolve4_t*>(arg);
+    uvLoopExecAsync(self->loop, [self]()
+    {
+        self->mUserCb(self, self->error); //the callback should delete self
+    });
+    vTaskDelete(nullptr);
+}
+
 static void lwipResolve4Cb(const char *name, const ip_addr_t *ipaddr, void *userp)
 {
     auto self = static_cast<uvx_dns_resolve4_t*>(userp);
@@ -716,13 +726,7 @@ static void lwipResolve4Cb(const char *name, const ip_addr_t *ipaddr, void *user
     {
         self->error = 1;
     }
-    printf("msg queue size2 = %d\n", self->loop->mMsgQueueLen);
-
-    uvLoopExecAsync(self->loop, [self]()
-    {
-        if (!self->mUserCb(self))
-            delete self;
-    });
+    xTaskCreate(&dns4ResultRelayTask, "uvDnsResultTask", 1800, self, 5, NULL);
 }
 
 UV_CAPI int uvx_dns_resolve4(uv_loop_t* loop, const char* host, uvx_dns_resolve4_t* req, uvx_dns4_cb cb, void* userp)

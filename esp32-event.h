@@ -259,7 +259,7 @@ UV_CAPI int uv_async_init(uv_loop_t* loop, uv_async_t* async, uv_async_cb cb);
 UV_CAPI int uv_async_send(uv_async_t* async);
 
 struct uvx_dns_resolve4_t;
-typedef int(*uvx_dns4_cb)(uvx_dns_resolve4_t*);
+typedef int(*uvx_dns4_cb)(uvx_dns_resolve4_t*, int error);
 struct uvx_dns_resolve4_t
 {
     uv_loop_t* loop;
