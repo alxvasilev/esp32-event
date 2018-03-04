@@ -710,7 +710,7 @@ static void dns4ResultRelayTask(void* arg)
     auto self = static_cast<uvx_dns_resolve4_t*>(arg);
     uvLoopExecAsync(self->loop, [self]()
     {
-        self->mUserCb(self, self->error); //the callback should delete self
+        self->mUserCb(self); //the callback should delete self
     });
     vTaskDelete(nullptr);
 }
