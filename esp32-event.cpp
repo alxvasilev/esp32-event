@@ -4,6 +4,7 @@
 #include <lwip/tcpip.h>
 #include <string.h>
 #include <esp_log.h>
+#include "dnsparser.h"
 
 #ifndef UV_MSGQUEUE_MAX_LEN
     #define UV_MSGQUEUE_MAX_LEN 4
@@ -704,37 +705,56 @@ UV_CAPI int uv_loop_close(uv_loop_t* loop)
     vSemaphoreDelete(loop->mMsgQueueMutex);
     return 0;
 }
-
-static void lwipResolve4Cb(const char *name, const ip_addr_t *ipaddr, void *userp)
+static void dnsEvent4Cb(uv_poll_t* poll, int status, int events)
 {
-    auto self = static_cast<uvx_dns_resolve4_t*>(userp);
-    if (ipaddr)
+    uv_poll_stop(poll);
+    auto req = (uvx_dns_resolve4_t*)poll->data;
+    if (status)
     {
-        self->addr.sin_addr.s_addr = ipaddr->u_addr.ip4.addr;
+        close(poll->fd);
+        req->mUserCb(req, status); //callback should free req
     }
     else
     {
-        self->error = 1;
-    }
-    printf("msg queue size2 = %d\n", self->loop->mMsgQueueLen);
-
-    uvLoopExecAsync(self->loop, [self]()
-    {
-        if (!self->mUserCb(self))
-            delete self;
-    });
-}
+        assert(events == UV_READABLE);
+        enum { kPacketBufSize = 512 };
+        char buf[kPacketBufSize];
+        auto len = recvfrom(poll->fd, buf, kPacketBufSize, MSG_DONTWAIT, gDnsServer.addr, gDnsServer.addLen);
+        close(poll->fd);
+        if (len <= 0)
+        {
+            req->mUserCb(req, UV_EIO);
+            return;
+        }
+        char addrBuf[256];
+        dnsParseResponse(buf, len, 0, addrBuf, sizeof(addrBuf));
 
 UV_CAPI int uvx_dns_resolve4(uv_loop_t* loop, const char* host, uvx_dns_resolve4_t* req, uvx_dns4_cb cb, void* userp)
 {
+    enum { kPacketBufSize = 512 };
     assert(host);
-    req->loop = loop;
+    char buf[kPacketBufSize];
+    int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (sock < 0)
+        return UV_ENOMEM;
+    unsigned long val = 1;
+    if(ioctlsocket(sock, FIONBIO, &val) != 0)
+        return UV_EFAULT;
+    uv_poll_init(loop, &req->mPoll, sock);
     req->mUserCb = cb;
-    req->host = strdup(host);
-    req->error = 0;
-    req->addr.sin_family = AF_INET;
     req->data = userp;
+    uv_poll_start(&req->mPoll, UV_READABLE, dnsEvent4Cb);
     UV_LOG_DEBUG("Resolving host '%s'...", host);
+    if(sendto(sock, buf, len, 0, (struct sockaddr*)&mServerAddr, sizeof(mServerAddr)) < 0)
+    {
+        auto err = errno;
+        uv_poll_stop(&req->mPoll);
+        close(sock);
+        return err;
+    }
+    return 0;
+}
+
     auto ret = tcpip_callback_with_block([](void* userp1)
     {
         auto ctx = static_cast<uvx_dns_resolve4_t*>(userp1);
