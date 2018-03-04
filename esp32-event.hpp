@@ -14,7 +14,7 @@ struct uvAutoDel
 };
 
 template <class F>
-void uvLoopExecAsync(uv_loop_s* loop, F&& func)
+void uvLoopExecAsync(uv_loop_t* loop, F&& func)
 {
     struct Message: public uv_message
     {
@@ -29,11 +29,11 @@ void uvLoopExecAsync(uv_loop_s* loop, F&& func)
         uvAutoDel<Message> autodel(custMsg);
         custMsg->mFunc();
     });
-    uv_loop_post_message(loop, newmsg);
+    uvx_loop_post_message(loop, newmsg);
 }
 
 template <class F>
-auto uvLoopExecSync(uv_loop_s* loop, F&& func) -> decltype(func())
+auto uvLoopExecSync(uv_loop_t* loop, F&& func) -> decltype(func())
 {
     class Message: public uv_message
     {

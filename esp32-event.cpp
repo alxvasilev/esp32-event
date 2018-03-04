@@ -1,5 +1,7 @@
 #include "esp32-event.hpp"
 #include <lwip/sockets.h>
+#include <lwip/dns.h>
+#include <lwip/tcpip.h>
 #include <string.h>
 #include <esp_log.h>
 
@@ -42,15 +44,24 @@ struct LoopTaskSetter
 {
     uv_loop_t* mLoop;
     LoopTaskSetter(uv_loop_t* loop)
-        :mLoop(loop) { loop->mTaskId = uv_thread_self(); }
-    ~LoopTaskSetter() { mLoop->mTaskId = NULL; }
+    :mLoop(loop)
+    {
+        auto handle = uv_thread_self();
+        mLoop->mTaskId = handle;
+        UV_LOG_DEBUG("Task %p entering event loop %p", handle, mLoop);
+    }
+    ~LoopTaskSetter()
+    {
+        mLoop->mTaskId = NULL;
+        UV_LOG_DEBUG("Task %p leaving event loop %p", uv_thread_self(), mLoop);
+    }
 };
 
 int udpsock_create_and_bind();
 
 UV_CAPI int uv_loop_init(uv_loop_t* loop)
 {
-    memset(loop, 0, sizeof(uv_loop_s));
+    memset(loop, 0, sizeof(uv_loop_t));
     loop->mMsgQueueMutex = xSemaphoreCreateMutexStatic(&loop->mMsgQueueMutexMem);
     int sock = udpsock_create_and_bind();
     if (sock < 0)
@@ -94,7 +105,7 @@ int udpsock_create_and_bind()
     }
     return sock;
 }
-UV_CAPI int uv_loop_wake_up(uv_loop_s* loop)
+UV_CAPI int uv_loop_wakeup(uv_loop_t* loop)
 {
     int rc = sendto(loop->mCtrlSendFd, "\0", 1, MSG_DONTWAIT, (struct sockaddr*)&loop->mCtrlAddr, sizeof(struct sockaddr_in));
     if (rc == 1)
@@ -103,19 +114,21 @@ UV_CAPI int uv_loop_wake_up(uv_loop_s* loop)
     }
     else if (rc < 0)
     {
-        UV_LOG_ERROR("uv_loop_wake_up: sendto() failed to send 1 byte over the control socket %s", strerror(errno));
+        UV_LOG_ERROR("uv_loop_wakeup: sendto() failed to send 1 byte over the control socket %s", strerror(errno));
         return UV_ENOMEM;
     }
     else
     {
         assert(rc == 0);
-        UV_LOG_ERROR("uv_loop_wake_up: sendto() sent zero bytes over the control socket");
+        UV_LOG_ERROR("uv_loop_wakeup: sendto() sent zero bytes over the control socket");
         return UV_ENOMEM;
     }
 }
-UV_CAPI int uv_loop_post_message(uv_loop_s* loop, uv_message* msg)
+UV_CAPI int uvx_loop_post_message(uv_loop_t* loop, uv_message* msg)
 {
+    printf("post message: %d\n", loop->mMsgQueueLen);
     while(loop->mMsgQueueLen > UV_MSGQUEUE_MAX_LEN);
+    printf("after while\n");
     MutexLocker locker(loop->mMsgQueueMutex);
     msg->mNext = NULL;
     if (loop->mMsgQueueLast)
@@ -129,21 +142,29 @@ UV_CAPI int uv_loop_post_message(uv_loop_s* loop, uv_message* msg)
     }
     loop->mMsgQueueLast = msg;
     loop->mMsgQueueLen++;
-    uv_loop_wake_up(loop);
+    uv_loop_wakeup(loop);
     UV_LOG_DEBUG("Posted message %p to queue", msg);
     return 0;
 }
-
-void loopProcessMessages(uv_loop_s* loop)
+void drainCtrlSocket(uv_loop_t* loop)
 {
-    //Message handlers may queue new message
+    uint8_t buf;
+    socklen_t len = sizeof(sockaddr_in);
+    while(recvfrom(loop->mCtrlRecvFd, &buf, 1, MSG_DONTWAIT, (sockaddr*)&loop->mCtrlAddr, &len) > 0);
+}
+void loopProcessMessages(uv_loop_t* loop)
+{
+    //drain ctrl socket first, because there may be no messages - uv_loop_wakeup() doesn't post messages
+    drainCtrlSocket(loop);
+
+    //Message handlers may queue new messages when processed
     while(loop->mMsgQueue)
     {
         uv_message* msg;
         //Detach the whole message queue
         mutexLock(loop->mMsgQueueMutex);
         //Queue is not locked between the check in while() and here,
-        //but it's only us that can consume the queue, so msg can't be set
+        //but it's only us that can consume the queue, so mMsgQueue can't be set
         //to null meanwhile
         msg = loop->mMsgQueue;
         assert(msg);
@@ -152,9 +173,7 @@ void loopProcessMessages(uv_loop_s* loop)
         mutexUnlock(loop->mMsgQueueMutex);
 
         // Empty the control socket packet queue
-        uint8_t buf;
-        socklen_t len = sizeof(sockaddr_in);
-        while(recvfrom(loop->mCtrlRecvFd, &buf, 1, MSG_DONTWAIT, (sockaddr*)&loop->mCtrlAddr, &len) > 0);
+        drainCtrlSocket(loop);
 
         // Process messages. Message queue is not locked, so message handlers can post new messages
         while(msg)
@@ -172,8 +191,13 @@ inline uv_time_t IRAM_ATTR now_ms()
     return xTaskGetTickCount() * portTICK_PERIOD_MS;
 }
 
+inline int loopHasActive(uv_loop_t* loop)
+{
+    return loop->mPolls || loop->mTimers || loop->mMsgQueue;
+}
+
 //insert in order of mFireTime
-void timerAdd(uv_timer_s* timer)
+void timerAdd(uv_timer_t* timer)
 {
     handle_assert_not_active(timer);
     auto loop = timer->loop;
@@ -263,7 +287,7 @@ UV_CAPI int uv_timer_again(uv_timer_t* timer)
     return 0;
 }
 
-bool loopMaybeFireFirstTimer(uv_loop_s* loop, uv_time_t now)
+bool loopMaybeFireFirstTimer(uv_loop_t* loop, uv_time_t now)
 {
     auto timer = loop->mTimers;
     if (!timer || (timer->mFireTime > now))
@@ -293,9 +317,11 @@ UV_CAPI void uv_timer_set_repeat(uv_timer_t* timer, uv_time_t repeat)
 }
 
 
-enum { kRunError = -1, kRunTimeout = 0, kRunHadEvent = 1, kRunStopped = 2 };
+enum { kRunError = -1, kRunTimeout = 0, kRunHadEvent = 1, kRunStopped = 2, kRunNoActive = 3 };
+
 UV_CAPI int uv_loop_run_once(uv_loop_t* loop, uv_time_t timeout)
 {
+    assert(timeout >= -2);
     LoopTaskSetter lts(loop);
     fd_set rfds, wfds, efds;
     int highest; //prevent warning about uninitialzied variable
@@ -307,11 +333,24 @@ UV_CAPI int uv_loop_run_once(uv_loop_t* loop, uv_time_t timeout)
     {
         until = timer->mFireTime;
     }
-    uv_time_t timeToWait;
-    while((timeToWait = until-now) >= 0)
+    for(;;)
     {
-        if (loopMaybeFireFirstTimer(loop, now))
-            continue;
+        uv_time_t timeToWait;
+        switch (timeout)
+        {
+            case UV_RUN_TILL_NOACTIVE:
+                if (!loopHasActive(loop))
+                    return kRunNoActive;
+                //no break here, falls through to the -1 case
+            case UV_RUN_FOREVER:
+                timeToWait = 0x7fffffff;
+                break;
+            default:
+                timeToWait = until-now;
+                if (timeToWait < 0)
+                    return kRunTimeout;
+        }
+        loopMaybeFireFirstTimer(loop, now); //don't restart the loop of a timer was fired - that would allow a hi-frequency timer to steal the loop
 
         uint8_t flags = loop->mFlags;
         if (flags & kPollsUpdated)
@@ -326,7 +365,7 @@ UV_CAPI int uv_loop_run_once(uv_loop_t* loop, uv_time_t timeout)
             FD_ZERO(&wfds);
             FD_ZERO(&efds);
             highest = loop->mCtrlRecvFd;
-            for(uv_poll_s* poll = loop->mPolls; poll; poll = poll->mNext)
+            for(uv_poll_t* poll = loop->mPolls; poll; poll = poll->mNext)
             {
                 int fd = poll->fd;
                 uv_poll_event events = poll->mEvents;
@@ -349,12 +388,12 @@ UV_CAPI int uv_loop_run_once(uv_loop_t* loop, uv_time_t timeout)
         else if (loop->mPollEventsUpdated)
         {
             loop->mPollEventsUpdated = 0;
-            for(uv_poll_s* poll = loop->mPolls; poll; poll = poll->mNext)
+            for(uv_poll_t* poll = loop->mPolls; poll; poll = poll->mNext)
             {
                 uv_poll_event events = poll->mEvents;
-                if ((events & UV_EVENTS_UPDATED) == 0)
+                if ((events & UVX_EVENTS_UPDATED) == 0)
                     continue;
-                poll->mEvents &= ~UV_EVENTS_UPDATED;
+                poll->mEvents &= ~UVX_EVENTS_UPDATED;
                 int fd = poll->fd;
                 if (events & UV_READABLE)
                     FD_SET(fd, &rfds);
@@ -384,7 +423,7 @@ UV_CAPI int uv_loop_run_once(uv_loop_t* loop, uv_time_t timeout)
 
         if (rc > 0)
         {
-            if (FD_ISSET(loop->mCtrlRecvFd, &rfds))
+            if (FD_ISSET(loop->mCtrlRecvFd, &arfds))
             {
                 UV_LOG_DEBUG("Loop woken up by control socket");
                 loopProcessMessages(loop);
@@ -394,7 +433,7 @@ UV_CAPI int uv_loop_run_once(uv_loop_t* loop, uv_time_t timeout)
                     return kRunStopped;
                 }
             }
-            for(uv_poll_s* pfd = loop->mPolls; pfd; pfd = pfd->mNext)
+            for(uv_poll_t* pfd = loop->mPolls; pfd; pfd = pfd->mNext)
             {
                 int fd = pfd->fd;
                 uv_poll_event subscrEvents = pfd->mEvents;
@@ -410,7 +449,8 @@ UV_CAPI int uv_loop_run_once(uv_loop_t* loop, uv_time_t timeout)
                 if (FD_ISSET(fd, &aefds))
                 {
                     pfd->mCallback(pfd, UV_EIO, events & subscrEvents);
-                    return kRunHadEvent;
+                    if (timeout >= 0)
+                        return kRunHadEvent;
                 }
                 else //no error
                 {
@@ -418,7 +458,8 @@ UV_CAPI int uv_loop_run_once(uv_loop_t* loop, uv_time_t timeout)
                     if (events)
                     {
                         pfd->mCallback(pfd, 0, events);
-                        return kRunHadEvent;
+                        if (timeout >= 0)
+                            return kRunHadEvent;
                     }
                 }
             }
@@ -431,27 +472,21 @@ UV_CAPI int uv_loop_run_once(uv_loop_t* loop, uv_time_t timeout)
         now = now_ms();
         loopMaybeFireFirstTimer(loop, now);
     }
-    return kRunTimeout;
-}
-
-int loopHasActive(uv_loop_s* loop)
-{
-    return loop->mPolls || loop->mTimers || loop->mMsgQueue;
+    return kRunNoActive;
 }
 
 UV_CAPI int uv_run(uv_loop_t* loop, uv_run_mode mode)
 {
     switch (mode)
     {
-    case UV_RUN_DEFAULT:
+    case UV_RUN_DEFAULT: //Run until stopped or no more active handles
     {
-        while(loopHasActive(loop))
-        {
-            int rc = uv_loop_run_once(loop, 3600000); //1 hour max wait
-            if (rc == kRunStopped)
-                return loopHasActive(loop);
-        }
-        return 0;
+        int rc = uv_loop_run_once(loop, UV_RUN_TILL_NOACTIVE);
+        return rc == kRunNoActive;
+    }
+    case UV_RUN_FOREVER:
+    {
+        return uv_loop_run_once(loop, UV_RUN_FOREVER);
     }
     case UV_RUN_ONCE:
     {
@@ -470,6 +505,7 @@ UV_CAPI int uv_run(uv_loop_t* loop, uv_run_mode mode)
 
 UV_CAPI int uv_poll_start(uv_poll_t* poll, int events, uv_poll_cb cb)
 {
+    // We are in the loop's thread, so no need to be atomic
     assert(events);
     loop_assert_thread(poll->loop);
     bool wasActive = (poll->mNext != nullptr);
@@ -479,6 +515,7 @@ UV_CAPI int uv_poll_start(uv_poll_t* poll, int events, uv_poll_cb cb)
 
     if (wasActive)
     {
+        poll->mEvents |= UVX_EVENTS_UPDATED;
         loop->mPollEventsUpdated = 1;
     }
     else
@@ -491,11 +528,33 @@ UV_CAPI int uv_poll_start(uv_poll_t* poll, int events, uv_poll_cb cb)
 }
 
 // Thread safe
-UV_CAPI int uv_poll_update_events(uv_poll_t* poll, int events)
+UV_CAPI int uvx_poll_update_events(uv_poll_t* poll, int events)
 {
-    poll->mEvents = events | UV_EVENTS_UPDATED;
+    if (poll->mEvents == (events & ~UVX_EVENTS_UPDATED))
+        return 0;
+    poll->mEvents = events | UVX_EVENTS_UPDATED;
     poll->loop->mPollEventsUpdated = 1;
-    uv_loop_wake_up(poll->loop);
+    uv_loop_wakeup(poll->loop);
+    return 0;
+}
+
+UV_CAPI int uvx_poll_add_events(uv_poll_t* poll, int events)
+{
+    if ((poll->mEvents & events) == events)
+        return UV_EALREADY;
+    poll->mEvents |= (events | UVX_EVENTS_UPDATED);
+    poll->loop->mPollEventsUpdated = 1;
+    uv_loop_wakeup(poll->loop);
+    return 0;
+}
+UV_CAPI int uvx_poll_remove_events(uv_poll_t* poll, int events)
+{
+    if ((poll->mEvents & events) == 0)
+        return UV_EALREADY;
+    poll->mEvents &= ~events;
+    poll->mEvents |= UVX_EVENTS_UPDATED;
+    poll->loop->mPollEventsUpdated = 1;
+    uv_loop_wakeup(poll->loop);
     return 0;
 }
 
@@ -507,6 +566,10 @@ UV_CAPI int uv_poll_stop(uv_poll_t* poll)
     if (prev)
     {
         prev->mNext = poll->mNext;
+    }
+    else
+    {
+        loop->mPolls = poll->mNext;
     }
     poll->mNext = nullptr;
     loop->mFlags |= kPollsUpdated;
@@ -546,7 +609,7 @@ UV_CAPI int uv_async_send(uv_async_t* async)
     if (async->mActive)
         return UV_EALREADY;
     auto newmsg = new AsyncExecMessage(async);
-    return uv_loop_post_message(async->loop, newmsg);
+    return uvx_loop_post_message(async->loop, newmsg);
 }
 
 template <class T>
@@ -640,4 +703,51 @@ UV_CAPI int uv_loop_close(uv_loop_t* loop)
         return UV_EBUSY;
     vSemaphoreDelete(loop->mMsgQueueMutex);
     return 0;
+}
+
+static void lwipResolve4Cb(const char *name, const ip_addr_t *ipaddr, void *userp)
+{
+    auto self = static_cast<uvx_dns_resolve4_t*>(userp);
+    if (ipaddr)
+    {
+        self->addr.sin_addr.s_addr = ipaddr->u_addr.ip4.addr;
+    }
+    else
+    {
+        self->error = 1;
+    }
+    printf("msg queue size2 = %d\n", self->loop->mMsgQueueLen);
+
+    uvLoopExecAsync(self->loop, [self]()
+    {
+        if (!self->mUserCb(self))
+            delete self;
+    });
+}
+
+UV_CAPI int uvx_dns_resolve4(uv_loop_t* loop, const char* host, uvx_dns_resolve4_t* req, uvx_dns4_cb cb, void* userp)
+{
+    assert(host);
+    req->loop = loop;
+    req->mUserCb = cb;
+    req->host = strdup(host);
+    req->error = 0;
+    req->addr.sin_family = AF_INET;
+    req->data = userp;
+    UV_LOG_DEBUG("Resolving host '%s'...", host);
+    auto ret = tcpip_callback_with_block([](void* userp1)
+    {
+        auto ctx = static_cast<uvx_dns_resolve4_t*>(userp1);
+        ip_addr_t cachedAddr;
+        auto rc = ::dns_gethostbyname_addrtype(ctx->host, &cachedAddr, lwipResolve4Cb, userp1, LWIP_DNS_ADDRTYPE_IPV4);
+        if (rc == ERR_OK)
+        {
+            lwipResolve4Cb(nullptr, &cachedAddr, userp1);
+        }
+        else if (rc != ERR_INPROGRESS)
+        {
+            lwipResolve4Cb(nullptr, nullptr, userp1);
+        }
+    }, req, 1);
+    return (ret == ERR_OK) ? 0 : UV_EFAULT;
 }
